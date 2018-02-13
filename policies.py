@@ -119,13 +119,13 @@ class CnnPolicy(object):
         self.value = value
 
 class MasteryPolicy(object):
-    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, reuse=False):
+    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, scope_name="model", reuse=False):
         nbatch = nenv * nsteps
         nh, nw, nc = obs_space.space
         nact = ac_space.n
         X = tf.placeholder(tf.uint8, shape=(None, nh, nw, nc * nstack))
         GX = tf.placeholder(tf.uint8, shape=(None, nh, nw, nc * nstack))
-        with tf.variable_scope('model', reuse=reuse):
+        with tf.variable_scope(scope_name, reuse=reuse):
             # check the filter sizes and strides for conv layers
             h = conv(tf.cast(X, tf.float32) / 255., 'c1', nf=16, rf=2, stride=1, init_scale=np.sqrt(2))
             h1 = conv(h, 'c2', nf=32, rf=2, stride=1, init_scale=np.sqrt(2))
@@ -162,7 +162,7 @@ class MasteryPolicy(object):
         self.value = value
 
 class MetaControllerPolicy(object):
-    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, nlstm=256, reuse=False):
+    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, nlstm=256, name_scope="meta_model", reuse=False):
         nbatch = nenv * nsteps
         nh, nw, nc = obs_space.shape
         obs_shape = (nbatch, nh, nw, nc * nstack)
@@ -170,7 +170,7 @@ class MetaControllerPolicy(object):
         X = tf.placeholder(tf.float32, obs_shape)
         M = tf.placeholder(tf.float32, [nbatch])
         S = tf.placeholder(tf.float32, [nenv, nlstm * 2])
-        with tf.variable_scope('meta_model', reuse=reuse):
+        with tf.variable_scope(name_scope, reuse=reuse):
             h = conv(tf.cast(X, tf.float32) / 255., 'c1', nf=16, rf=2, stride=1, init_scale=np.sqrt(2))
             h1 = conv(h, 'c2', nf=32, rf=2, stride=1, init_scale=np.sqrt(2))
             h1 = conv_to_fc(h1)
