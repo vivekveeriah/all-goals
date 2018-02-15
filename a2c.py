@@ -7,15 +7,15 @@ import numpy as np
 import tensorflow as tf
 from auxiliary_tasks import logger
 
-from mastery.common.misc_util import set_global_seeds
-from mastery.common.math_util import explained_variance
-from mastery.common.vec_env.subproc_vec_env import SubprocVecEnv
-from mastery.common.atari_wrappers import wrap_deepmind
+from .common.misc_util import set_global_seeds
+from .common.math_util import explained_variance
+from .common.vec_env.subproc_vec_env import SubprocVecEnv
+from .common.atari_wrappers import wrap_deepmind
 
-from mastery.utils import discount_with_dones
-from mastery.utils import Scheduler, make_path, find_trainable_variables
-from mastery.policies import CnnPolicy
-from mastery.utils import cat_entropy, mse
+from .utils import discount_with_dones
+from .utils import Scheduler, make_path, find_trainable_variables
+from .policies import CnnPolicy
+from .utils import cat_entropy, mse
 
 class Model(object):
     def __init__(self, policy, ob_space, ac_space, nenvs, nsteps, nstack, num_procs, gamma=0.99, 

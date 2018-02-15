@@ -1,12 +1,12 @@
 import os, logging, gym
 import argparse, sys
-from mastery import logger
-from mastery.common.misc_util import set_global_seeds
-from mastery.monitor import Monitor
-from mastery.a2c import learn
-from mastery.common.vec_env.subproc_vec_env import SubprocVecEnv
-from mastery.common.atari_wrappers import make_atari, wrap_deepmind
-from mastery.policies import CnnPolicy, LstmPolicy, LnLstmPolicy
+from . import logger
+from .common.misc_util import set_global_seeds
+from .monitor import Monitor
+from .a2c import learn
+from .common.vec_env.subproc_vec_env import SubprocVecEnv
+from .common.atari_wrappers import make_atari, wrap_deepmind
+from .policies import CnnPolicy, LstmPolicy, LnLstmPolicy
 
 
 def train(env_id, num_timesteps, seed, policy, lrschedule, num_cpu, eval_interval, eval_steps):

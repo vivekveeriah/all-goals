@@ -1,5 +1,5 @@
-from mastery.common.vec_env import VecEnv
-from mastery.common.running_mean_std import RunningMeanStd
+from . import VecEnv
+from ..running_mean_std import RunningMeanStd
 import numpy as np
 
 class VecNormalize(VecEnv):

@@ -1,6 +1,6 @@
 import numpy as np
 from multiprocessing import Process, Pipe
-from mastery.common.vec_env import VecEnv
+from . import VecEnv
 
 
 def worker(remote, parent_remote, env_fn_wrapper):

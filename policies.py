@@ -1,6 +1,6 @@
 import numpy as np
 import tensorflow as tf
-from mastery.utils import conv, fc, fc_embedding, conv_to_fc, batch_to_seq, seq_to_batch, lstm, lnlstm, sample
+from .utils import conv, fc, fc_embedding, conv_to_fc, batch_to_seq, seq_to_batch, lstm, lnlstm, sample
 
 class LnLstmPolicy(object):
     def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack, nlstm=256, reuse=False):

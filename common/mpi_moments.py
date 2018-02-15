@@ -1,6 +1,6 @@
 from mpi4py import MPI
 import numpy as np
-from mastery.common import zipsame
+from . import zipsame
 
 def mpi_moments(x, axis=0):
     x = np.asarray(x, dtype='float64')

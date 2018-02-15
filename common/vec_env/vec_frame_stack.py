@@ -1,4 +1,4 @@
-from mastery.common.vec_env import VecEnv
+from . import VecEnv
 import numpy as np
 from gym import spaces
 
