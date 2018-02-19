@@ -39,8 +39,8 @@ def ortho_init(scale=1.0):
         return (scale * q[:shape[0], :shape[1]]).astype(np.float32)
     return _ortho_init
 
-def conv(x, scope, nf, rf, stride, pad='VALID', act=tf.nn.relu, init_scale=1.0):
-    with tf.variable_scope(scope):
+def conv(x, scope, nf, rf, stride, pad='VALID', act=tf.nn.relu, init_scale=1.0, reuse=False):
+    with tf.variable_scope(scope, reuse=reuse):
         nin = x.get_shape()[3].value
         w = tf.get_variable('w', shape=[rf, rf, nin, nf], initializer=ortho_init(init_scale))
         b = tf.get_variable('b', shape=[nf], initializer=tf.constant_initializer(0.0))
@@ -48,8 +48,8 @@ def conv(x, scope, nf, rf, stride, pad='VALID', act=tf.nn.relu, init_scale=1.0):
         h = act(z)
         return h
 
-def fc(x, scope, nh, act=tf.nn.relu, init_scale=1.0):
-    with tf.variable_scope(scope):
+def fc(x, scope, nh, act=tf.nn.relu, init_scale=1.0, reuse=False):
+    with tf.variable_scope(scope, reuse=reuse):
         nin = x.get_shape()[1].value
         w = tf.get_variable("w", shape=[nin, nh], initializer=ortho_init(init_scale))
         b = tf.get_variable("b", shape=[nh], initializer=tf.constant_initializer(0.0))
@@ -57,8 +57,8 @@ def fc(x, scope, nh, act=tf.nn.relu, init_scale=1.0):
         h = act(z)
         return h
 
-def fc_embedding(x, scope, nh, act=tf.nn.relu, init_scale=1.0):
-    with tf.variable_scope(scope):
+def fc_embedding(x, scope, nh, act=tf.nn.relu, init_scale=1.0, reuse=False):
+    with tf.variable_scope(scope, reuse=reuse):
         nin = x.get_shape()[1].value
         w = tf.get_variable("w", shape=[nin, nh], initializer=ortho_init(init_scale))
         z = tf.matmul(x, w)

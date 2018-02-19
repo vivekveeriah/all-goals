@@ -1,11 +1,12 @@
 import os.path as osp
+import random
 import gym
 import time
 import joblib
 import logging
 import numpy as np
 import tensorflow as tf
-from auxiliary_tasks import logger
+from . import logger
 
 from .common.misc_util import set_global_seeds
 from .common.math_util import explained_variance
@@ -16,44 +17,49 @@ from .utils import discount_with_dones
 from .utils import Scheduler, make_path, find_trainable_variables
 from .policies import CnnPolicy
 from .utils import cat_entropy, mse
+from .replay_buffer import ReplayBuffer
+
+EPSILON = 0.5
 
 class Model(object):
-    def __init__(self, policy, ob_space, ac_space, nenvs, nsteps, nstack, num_procs, gamma=0.99, 
-            ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
+    def __init__(self, controller_policy, ob_space, ac_space, nenvs, nsteps, nstack, num_procs, log_folder_path, log_interval, gamma=0.99,
+            ent_coef=0.01, vf_coef=0.5, max_grad_norm_controller=40.0, lr=7e-4, max_grad_norm_meta_controller=0.5,
             alpha=0.99, epsilon=1e-5, total_timesteps=int(80e6), lrschedule='linear', 
-            meta_lr=7e-4, alpha_meta=0.99, epsilon_meta=1e-5, meta_total_timesteps=int(80e6), meta_lrschedule='linear'):
+            meta_lr=7e-4, alpha_meta=0.99, epsilon_meta=1e-5, meta_total_timesteps=int(80e6), meta_lrschedule='linear',
+            buffer_size=int(1e6)):
         config = tf.ConfigProto(allow_soft_placement=True,
                                 intra_op_parallelism_threads=num_procs,
                                 inter_op_parallelism_threads=num_procs)
         config.gpu_options.allow_growth = True
         sess = tf.Session(config=config)
 
-        # actions in the meta-controller
+        # actions in the meta-controller (number of dimensions)
         # batch-size over which the meta-controller operates in 
-        nact_meta = ac_meta_space.n
-        nbatch_meta = nenvs * nsteps_meta
+        # nact_meta = ac_meta_space.n
+        # nbatch_meta = nenvs * nsteps_meta
 
         # action in the all-goals agent
         # batch-size over which the all-goals agent operates in 
         nact = ac_space.n
         nbatch = nenvs * nsteps
+        nh, nw, nc = ob_space.shape
 
         # A: actions for all-goals agent
         # R: rewards for the all-goals agent
         # LR: step-size for the all-goals agent
-        A = tf.placeholder(tf.int32, [nbatch], name="actions")
-        R = tf.placeholder(tf.float32, [nbatch], name="rewards")
+        A = tf.placeholder(tf.int32, (None, ), name="actions")
+        R = tf.placeholder(tf.float32, (None, ), name="rewards")
         LR = tf.placeholder(tf.float32, [], name="step_size")
-        done_mask = tf.placeholder(tf.float32, [nbatch], name="done_mask")
+        done_mask = tf.placeholder(tf.float32, (None, ), name="done_mask")
 
         # A_meta: actions selected by the meta-controller
         # ADV_meta: advantage value of the actions selected by the meta-controller
         # R_meta: rewards achieved by the meta-controller
         # LR_meta: step-size for the meta-controller
-        A_meta = tf.placeholder(tf.int32, [nbatch_meta], name="meta_actions")
-        ADV_meta = tf.placeholder(tf.float32, [nbatch_meta], name="meta_advantage")
-        R_meta = tf.placeholder(tf.float32, [nbatch_meta], name="meta_rewards")
-        LR_meta = tf.placeholder(tf.float32, [], name="meta_step_size")
+        # A_meta = tf.placeholder(tf.int32, [nbatch_meta], name="meta_actions")
+        # ADV_meta = tf.placeholder(tf.float32, [nbatch_meta], name="meta_advantage")
+        # R_meta = tf.placeholder(tf.float32, [nbatch_meta], name="meta_rewards")
+        # LR_meta = tf.placeholder(tf.float32, [], name="meta_step_size")
 
         # the return achieved by the all-goals agent on a random goal-state 
         # this is here to measure learning progress in the all-goals agent, so that I don't have to wait for a long time to see the learning
@@ -61,47 +67,54 @@ class Model(object):
 
         # step_model is used to pick actions in the environment
         # train_model is used to train the agent from a sample of experience tuples from the replay buffer
+        # print('**** creating step model ****')
         step_model = controller_policy(sess, ob_space, ac_space, nenvs, 1, nstack, name_scope="controller", reuse=False)
+        # print('**** created step model ****')
+        # print('**** creating train model ****')
         train_model = controller_policy(sess, ob_space, ac_space, nenvs, nsteps, nstack, name_scope="controller", reuse=True)
+        # print('**** created train model ****')
+        # print('**** creating target model ****')
         target_train_model = controller_policy(sess, ob_space, ac_space, nenvs, nsteps, nstack, name_scope="target_controller", reuse=False)
+        # print('**** created target model ****')
+        replay_buffer = ReplayBuffer(memory_size=buffer_size)
+        goal_buffer = {}
 
         # step_meta_model is used to pick goal-states for generating experience through the all-goals agent
         # train_meta_model is used to train the meta-controller based on the on-policy experience generated by the meta-controller
-        step_meta_model = meta_controller_policy(sess, ob_space, ac_space, nenvs, 1, nstack, name_scope="meta_controller", reuse=False)
-        train_meta_model = meta_controller_policy(sess, ob_space, ac_space, nenvs, nsteps, nstack, name_scope="meta_controller", reuse=True)
+        # step_meta_model = meta_controller_policy(sess, ob_space, ac_space, nenvs, 1, nstack, name_scope="meta_controller", reuse=False)
+        # train_meta_model = meta_controller_policy(sess, ob_space, ac_space, nenvs, nsteps, nstack, name_scope="meta_controller", reuse=True)
 
         # training variables needed for updating the meta-controller
         # on-policy actor-critic updates are used for training the meta-controller
-        neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_meta_model.pi, labels=A_meta)
-        pg_loss = tf.reduce_mean(ADV_meta * neglogpac)
-        vf_loss = tf.reduce_mean(mse(tf.squeeze(train_meta_model.vf), R_meta))
-        entropy = tf.reduce_mean(cat_entropy(train_meta_model.pi))
-        meta_controller_loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
+        # neglogpac = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=train_meta_model.pi, labels=A_meta)
+        # pg_loss = tf.reduce_mean(ADV_meta * neglogpac)
+        # vf_loss = tf.reduce_mean(mse(tf.squeeze(train_meta_model.vf), R_meta))
+        # entropy = tf.reduce_mean(cat_entropy(train_meta_model.pi))
+        # meta_controller_loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
 
         # create an op to synchronize the target and learning networks
-        controller_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=tf.get_variable_scope().name + "controller")
-        controller_target_q_func_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=tf.get_variable_scope().name + "meta_controller")
+        controller_q_func_vars = [t for t in tf.trainable_variables() if t.name.startswith("controller")]
+        controller_target_q_func_vars = [t for t in tf.trainable_variables() if t.name.startswith("target_controller")]
         update_target_network = []
-        for var, var_target in zip(sorted(controller_q_func_vars, lambda v: v.name),
-                                    sorted(controller_target_q_func_vars, lambda v: v.name)):
+        for var, var_target in zip(sorted(controller_q_func_vars, key=lambda v: v.name),
+                                    sorted(controller_target_q_func_vars, key=lambda v: v.name)):
             update_target_network.append(var_target.assign(var))
         update_target_network = tf.group(*update_target_network)
 
-        # TODO: add the loss variable summaries for controller
         current_q_values = tf.reduce_sum(train_model.q * tf.one_hot(A, nact), axis=1)
         target_q_values = R + gamma * (1.0 - done_mask) * tf.stop_gradient(tf.reduce_max(target_train_model.q, axis=1))
         controller_loss = tf.losses.huber_loss(target_q_values, current_q_values)
 
-        tf.summary.scalar('meta_model/neglogpac', tf.reduce_mean(neglogpac))
-        tf.summary.scalar('meta_model/pg_loss', tf.reduce_mean(pg_loss))
-        tf.summary.scalar('meta_model/vf_loss', tf.reduce_mean(vf_loss))
-        tf.summary.scalar('meta_model/entropy_term', tf.reduce_mean(entropy))
-        tf.summary.scalar('meta_model/meta_controller_loss', tf.reduce_mean(meta_controller_loss))
-
-        tf.summary.scalar('meta_model/actions', tf.reduce_mean(A_meta))
-        tf.summary.scalar('meta_model/advantage', tf.reduce_mean(ADV_meta))
-        tf.summary.scalar('meta_model/rewards', tf.reduce_mean(R_meta))
-        tf.summary.scalar('meta_model/step_size', tf.reduce_mean(LR_meta))
+        # tf.summary.scalar('meta_model/neglogpac', tf.reduce_mean(neglogpac))
+        # tf.summary.scalar('meta_model/pg_loss', tf.reduce_mean(pg_loss))
+        # tf.summary.scalar('meta_model/vf_loss', tf.reduce_mean(vf_loss))
+        # tf.summary.scalar('meta_model/entropy_term', tf.reduce_mean(entropy))
+        # tf.summary.scalar('meta_model/meta_controller_loss', tf.reduce_mean(meta_controller_loss))
+        #
+        # tf.summary.scalar('meta_model/actions', tf.reduce_mean(A_meta))
+        # tf.summary.scalar('meta_model/advantage', tf.reduce_mean(ADV_meta))
+        # tf.summary.scalar('meta_model/rewards', tf.reduce_mean(R_meta))
+        # tf.summary.scalar('meta_model/step_size', tf.reduce_mean(LR_meta))
 
         tf.summary.scalar('model/current_q_values', tf.reduce_mean(current_q_values))
         tf.summary.scalar('model/target_q_values', tf.reduce_mean(target_q_values))
@@ -110,6 +123,10 @@ class Model(object):
         tf.summary.scalar('model/actions', tf.reduce_mean(A))
         tf.summary.scalar('model/rewards', tf.reduce_mean(R))
         tf.summary.scalar('model/step_size', tf.reduce_mean(LR))
+        tf.summary.scalar('model/max_actions', tf.reduce_max(A))
+        tf.summary.scalar('model/min_actions', tf.reduce_min(A))
+        tf.summary.scalar('model/max_rewards', tf.reduce_max(R))
+        tf.summary.scalar('model/min_rewards', tf.reduce_min(R))
 
         tf.summary.scalar('model/eval_return', tf.reduce_mean(eval_return))
 
@@ -120,57 +137,130 @@ class Model(object):
             tf.summary.histogram(var.name, var)
         grads_with_controller_vars = list(zip(controller_grads, controller_params))
         for grad, var in grads_with_controller_vars:
-            tf.summary.histogram(var.name + '/grad', grad)
+            if grad is not None:
+                tf.summary.histogram(var.name + '/grad', grad)
 
         if max_grad_norm_controller is not None:
             controller_grads, controller_grads_norm = tf.clip_by_global_norm(controller_grads, max_grad_norm_controller)
 
         clipped_grads_with_controller_vars = list(zip(controller_grads, controller_params))
         for grad, var in clipped_grads_with_controller_vars:
-            tf.summary.histogram(var.name + '/clipped_grad', grad)
+            if grad is not None:
+                tf.summary.histogram(var.name + '/clipped_grad', grad)
 
-        meta_controller_params = find_trainable_variables('meta_controller')
-        meta_controller_grads = tf.gradients(meta_controller_loss, meta_controller_params)
-        for var in meta_controller_params:
-            tf.summary.histogram(var.name, var)
-        grads_with_meta_controller_vars = list(zip(meta_controller_grads, meta_controller_params))
-        for grad, var in grads_with_meta_controller_vars:
-            tf.summary.histogram(var.name + '/grad', grad)
-
-        if max_grad_norm_meta_controller is not None:
-            meta_controller_grads, meta_controller_grads_norm = tf.clip_by_global_norm(meta_controller_grads, max_grad_norm_meta_controller)
-
-        clipped_grads_with_meta_controller_vars = list(zip(meta_controller_grads, meta_controller_params))
-        for grad, var in clipped_grads_with_meta_controller_vars:
-            tf.summary.histogram(var.name + '/clipped_grad', grad)
+        # meta_controller_params = find_trainable_variables('meta_controller')
+        # meta_controller_grads = tf.gradients(meta_controller_loss, meta_controller_params)
+        # for var in meta_controller_params:
+        #     tf.summary.histogram(var.name, var)
+        # grads_with_meta_controller_vars = list(zip(meta_controller_grads, meta_controller_params))
+        # for grad, var in grads_with_meta_controller_vars:
+        #     tf.summary.histogram(var.name + '/grad', grad)
+        #
+        # if max_grad_norm_meta_controller is not None:
+        #     meta_controller_grads, meta_controller_grads_norm = tf.clip_by_global_norm(meta_controller_grads, max_grad_norm_meta_controller)
+        #
+        # clipped_grads_with_meta_controller_vars = list(zip(meta_controller_grads, meta_controller_params))
+        # for grad, var in clipped_grads_with_meta_controller_vars:
+        #     tf.summary.histogram(var.name + '/clipped_grad', grad)
 
         # create ops for applying the gradients to the networks
         # create ops for annealing the step-size 
         # create ops for writing the log summaries to file
         controller_grads  = list(zip(controller_grads, controller_params))
-        meta_controller_grads = list(zip(meta_controller_grads, meta_controller_params))
-        controller_trainer = tf.train.RMSPropOptimizer(learning_rate=LR_meta, decay=alpha_meta, epsilon=epsilon_meta)
-        meta_controller_trainer = tf.train.RMSPropOptimizer(learning_rate=LR, decay=alpha, epsilon=epsilon)
+        # meta_controller_grads = list(zip(meta_controller_grads, meta_controller_params))
+        controller_trainer = tf.train.RMSPropOptimizer(learning_rate=LR, decay=alpha_meta, epsilon=epsilon_meta)
+        # meta_controller_trainer = tf.train.RMSPropOptimizer(learning_rate=LR_meta, decay=alpha, epsilon=epsilon)
         _controller_train = controller_trainer.apply_gradients(controller_grads)
-        _meta_controller_train = meta_controller_trainer.apply_gradients(meta_controller_grads)
+        # _meta_controller_train = meta_controller_trainer.apply_gradients(meta_controller_grads)
 
         lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
-        meta_lr = Scheduler(v=meta_lr, nvalues=meta_total_timesteps, schedule=meta_lrschedule)
+        # meta_lr = Scheduler(v=meta_lr, nvalues=meta_total_timesteps, schedule=meta_lrschedule)
         merge_op = tf.summary.merge_all()
         summary_writer = tf.summary.FileWriter(log_folder_path, graph=tf.get_default_graph())
 
-        def train_meta_controller(obs, states, rewards, masks, actions, values, t, evaluated_return):
-            advs = rewards - values
+        def train_controller(obs, next_obs, goal_obses, rewards, actions, terminal_masks, t, evaluated_return):
             for step in range(len(obs)):
                 cur_lr = lr.value()
-            td_map = {train_meta_model.X: obs, A_meta: actions, R_meta: rewards, ADV_meta: advs, LR_meta: cur_lr}
-            if states != []:
-                td_map[train_meta_model.S] = states
-                td_map[train_meta_model.M] = masks
-            
+            td_map = {train_model.X: obs,  target_train_model.X: next_obs, A: actions, R: rewards, LR: cur_lr,
+                      train_model.GX: goal_obses, target_train_model.GX: goal_obses, done_mask: terminal_masks,
+                      eval_return: evaluated_return}
+            q_value_loss, _, summary = sess.run([controller_loss, _controller_train, merge_op], feed_dict=td_map)
+            summary_writer.add_summary(summary=summary, global_step=t * nbatch)
 
+            return q_value_loss
 
+        # TODO: Need to change the save and load methods to store target net and manager net
+        def save(save_path):
+            ps = sess.run(controller_params)
+            make_path(save_path)
+            joblib.dump(ps, save_path)
 
+        def load(load_path):
+            loaded_params = joblib.load(load_path)
+            restores = []
+            for p, loaded_p in zip(controller_params, loaded_params):
+                restores.append(p.assign(loaded_p))
+            ps = sess.run(restores)
+
+        def add_to_goal_buffer(x):
+            assert x.shape == (10, 10, 3)
+            if hash(np.array(x).tostring()) not in goal_buffer:
+                goal_buffer[np.array(x).tostring()] = np.array(x)
+
+        def add_to_replay_buffer(x, a, r, x_prime, done):
+            assert x.shape == (10, 10, 3)
+            assert x_prime.shape == (10, 10, 3)
+            replay_buffer.add(x, a, r, x_prime, done)
+
+        def sample_goals_for_update(num_goals):
+            random_goals = random.sample(list(goal_buffer), num_goals)
+            sampled_goals = []
+            for i in random_goals:
+                sampled_goals.append(goal_buffer[i])
+            return sampled_goals
+
+        def sample_goals_for_behavior(nenvs):
+            # randomly sample a goal
+            try:
+                random_goal_keys = random.sample(list(goal_buffer), nenvs)
+            except ValueError:
+                goal_obs_for_behavior = np.random.randint(255, size=(nenvs, nh, nw, nc * nstack), dtype=np.uint8)
+                return goal_obs_for_behavior
+
+            goal_obs_for_behavior = np.zeros((nenvs, nh, nw, nc * nstack), dtype=np.uint8)
+            for i, idx in enumerate(random_goal_keys):
+                goal_obs_for_behavior[i] = goal_buffer[idx]
+            return goal_obs_for_behavior
+
+        def num_goals_in_buffer():
+            return len(list(goal_buffer))
+
+        def synchronize_target_net():
+            sess.run(update_target_network)
+
+        def finalize_graph():
+            sess.graph.finalize()
+
+        self.replay_buffer = replay_buffer
+        self.add_to_goal_buffer = add_to_goal_buffer
+        self.add_to_replay_buffer = add_to_replay_buffer
+        self.sample_goals_for_update = sample_goals_for_update
+        self.sample_goals_for_behavior = sample_goals_for_behavior
+        self.num_goals_in_buffer = num_goals_in_buffer
+        self.synchronize_target_net = synchronize_target_net
+        self.finalize_graph = finalize_graph
+
+        self.train_controller = train_controller
+        self.step_model = step_model
+        self.train_model = train_model
+        self.target_train_model = target_train_model
+        self.step = step_model.step
+        self.value = step_model.value
+        self.initial_state = step_model.initial_state
+        self.save = save
+        self.load = load
+
+        tf.global_variables_initializer().run(session=sess)
 
 class Runner(object):
 
@@ -180,10 +270,11 @@ class Runner(object):
         nh, nw, nc = env.observation_space.shape
         nenv = env.num_envs
         self.batch_ob_shape = (nenv * nsteps, nh, nw, nc * nstack)
-        self.obs = np.zeros((nenv, nh, nw, nc*nstack), dtype=np.uint8)
+        self.obs = np.zeros((nenv, nh, nw, nc * nstack), dtype=np.uint8)
         self.nc = nc
         obs = env.reset()
-        self.update_obs(obs)
+        self.obs = np.copy(obs)
+        # self.update_obs(obs)
         self.gamma = gamma
         self.nsteps = nsteps
         self.states = model.initial_state
@@ -192,7 +283,8 @@ class Runner(object):
         self.eval_env = eval_env
         self.eval_obs = np.zeros((1, nh, nw, nc * nstack), dtype=np.uint8)
         eval_obs = self.eval_env.reset()
-        self.update_eval_obs(eval_obs)
+        self.eval_obs = np.copy(eval_obs)
+        # self.update_eval_obs(eval_obs)
         self.eval_initial_state = model.initial_state
         self.eval_state = model.initial_state
         self.eval_dones = [False for _ in range(1)]
@@ -216,75 +308,62 @@ class Runner(object):
         self.eval_obs = np.roll(self.eval_obs, shift=-self.nc, axis=3)
         self.eval_obs[:, :, :, -self.nc:] = eval_obs
 
-    def run(self):
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones = [],[],[],[],[]
-        mb_states = self.states
-        for n in range(self.nsteps):
-            actions, values, states = self.model.step(self.obs, self.states, self.dones)
-            mb_obs.append(np.copy(self.obs))
-            mb_actions.append(actions)
-            mb_values.append(values)
-            mb_dones.append(self.dones)
-            obs, rewards, dones, _ = self.env.step(actions)
-            self.states = states
-            self.dones = dones
-            for n, done in enumerate(dones):
-                if done:
-                    self.obs[n] = self.obs[n]*0
-            self.update_obs(obs)
-            mb_rewards.append(rewards)
-        mb_dones.append(self.dones)
-        # batch of steps to batch of rollouts
-        mb_obs = np.asarray(mb_obs, dtype=np.uint8).swapaxes(1, 0).reshape(self.batch_ob_shape)
-        mb_rewards = np.asarray(mb_rewards, dtype=np.float32).swapaxes(1, 0)
-        mb_actions = np.asarray(mb_actions, dtype=np.int32).swapaxes(1, 0)
-        mb_values = np.asarray(mb_values, dtype=np.float32).swapaxes(1, 0)
-        mb_dones = np.asarray(mb_dones, dtype=np.bool).swapaxes(1, 0)
-        mb_masks = mb_dones[:, :-1]
-        mb_dones = mb_dones[:, 1:]
-        last_values = self.model.value(self.obs, self.states, self.dones).tolist()
-        # discount/bootstrap off value fn
-        for n, (rewards, dones, value) in enumerate(zip(mb_rewards, mb_dones, last_values)):
-            rewards = rewards.tolist()
-            dones = dones.tolist()
-            if dones[-1] == 0:
-                rewards = discount_with_dones(rewards+[value], dones+[0], self.gamma)[:-1]
-            else:
-                rewards = discount_with_dones(rewards, dones, self.gamma)
-            mb_rewards[n] = rewards
-            #
-            # if n == 0 and True in dones:
-            #     print(dones)
-            #     print(rewards)
+    def run(self, goal_obs, random_mask):
+        assert self.obs.shape == goal_obs.shape
+        assert len(goal_obs) == len(random_mask)
+        actions, _ = self.model.step(self.obs, goal_obs)
+        # print('actions: {}'.format(actions))
 
-        mb_rewards = mb_rewards.flatten()
-        mb_actions = mb_actions.flatten()
-        mb_values = mb_values.flatten()
-        mb_masks = mb_masks.flatten()
-        return mb_obs, mb_states, mb_rewards, mb_masks, mb_actions, mb_values
+        # modify the actions to take in env depending on the goal that is set for this episode
+        for idx in range(len(random_mask)):
+            if random_mask[idx] or np.random.rand() < EPSILON:
+                actions[0][idx] = np.random.randint(self.env.action_space.n)
+
+        actions = list(actions[0])
+
+        obs, rewards, dones, _ = self.env.step(actions)
+        # print('obs.shape: {}'.format(obs.shape))
+        for idx in range(self.env.num_envs):
+            self.model.add_to_replay_buffer(self.obs[idx], actions[idx], rewards[idx], obs[idx], dones[idx])
+            self.model.add_to_goal_buffer(self.obs[idx])
+
+        self.obs = np.copy(obs)
+
+        return_list = [False] * self.env.num_envs
+        for idx in range(self.env.num_envs):
+            if np.array_equal(self.obs[idx], goal_obs[idx]) and not random_mask[idx]:
+                return_list[idx] = True
+        return return_list
 
     def eval(self, eval_steps):
         self.eval_obs = np.zeros(self.eval_obs.shape, dtype=np.uint8)
         eval_obs = self.eval_env.reset()
-        self.update_eval_obs(eval_obs)
+        self.eval_obs = np.copy(eval_obs)
+        # self.update_eval_obs(eval_obs)
         self.eval_state = self.eval_initial_state
         self.eval_dones = [False for _ in range(1)]
 
         G = 0.0
-
+        goal_obs_eval = self.model.sample_goals_for_behavior(1)
         for _ in range(eval_steps):
-            actions, _, states = self.model.step(self.eval_obs, self.eval_state, self.eval_dones)
+            actions, _ = self.model.step(self.eval_obs, goal_obs_eval)
+            actions = list(actions[0])
             obs, rewards, dones, _ = self.eval_env.step(actions)
-            self.update_eval_obs(obs)
-            self.eval_state = states
-            self.eval_dones = dones
-            G += rewards[0]
+            # self.update_eval_obs(obs)
+            self.eval_obs = np.copy(obs)
+            if np.array_equal(self.eval_obs, goal_obs_eval):
+                return G
+            G += -1
             for n, done in enumerate(dones):
                 if done:
                     return G
         return G
 
-def learn(policy, env, seed, eval_env=None, eval_interval=None, eval_steps=None, nsteps=5, nstack=4, total_timesteps=int(80e6), vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, lr=7e-4, lrschedule='linear', epsilon=1e-5, alpha=0.99, gamma=0.99, log_interval=100):
+def learn(controller_policy, env, seed, eval_env=None, eval_interval=None, eval_steps=None, nsteps=5, nstack=4, batch_size=16,
+          num_goals_per_update=32, timesteps_per_episode=100, target_update_freq=1000, total_timesteps=int(80e6),
+          vf_coef=0.5, ent_coef=0.01, max_grad_norm_controller=40.0, lr=0.00025, lrschedule='linear', epsilon=1e-5, alpha=0.99,
+          gamma=0.99, log_interval=100, log_folder_path='all-goals/logs'):
+
     tf.reset_default_graph()
     set_global_seeds(seed)
 
@@ -292,31 +371,65 @@ def learn(policy, env, seed, eval_env=None, eval_interval=None, eval_steps=None,
     ob_space = env.observation_space
     ac_space = env.action_space
     num_procs = len(env.remotes) # HACK
-    model = Model(policy=policy, ob_space=ob_space, ac_space=ac_space, nenvs=nenvs, nsteps=nsteps, nstack=nstack, num_procs=num_procs, ent_coef=ent_coef, vf_coef=vf_coef,
-            max_grad_norm=max_grad_norm, lr=lr, alpha=alpha, epsilon=epsilon, total_timesteps=total_timesteps, lrschedule=lrschedule)
+    model = Model(controller_policy=controller_policy, ob_space=ob_space, ac_space=ac_space, nenvs=nenvs, nsteps=nsteps, nstack=nstack, num_procs=num_procs, ent_coef=ent_coef, vf_coef=vf_coef,
+                  max_grad_norm_controller=max_grad_norm_controller, lr=lr, alpha=alpha, epsilon=epsilon, total_timesteps=total_timesteps, lrschedule=lrschedule,
+                  log_folder_path=log_folder_path, log_interval=log_interval)
     runner = Runner(env, model, eval_env=eval_env, nsteps=nsteps, nstack=nstack, gamma=gamma)
 
     nbatch = nenvs * nsteps
     tstart = time.time()
-    evaluated_return = -1000
+    evaluated_return = np.nan
+
+    # the 1st dimension of this is nenvs
+    goal_obses_for_behavior = model.sample_goals_for_behavior(nenvs)
+    # print('goal_obses for behavior')
+    random_actions_per_env = [True] * nenvs  # True corresponds to random exploration
+    time_steps_per_env = [0] * nenvs
+    q_value_loss = np.nan
+    model.synchronize_target_net()
+    # print('synchornize target net')
+
+    model.finalize_graph()
+    # print('finalize graph')
 
     for update in range(1, total_timesteps // nbatch + 1):
-        obs, states, rewards, masks, actions, values = runner.run()
-        policy_loss, value_loss, policy_entropy = model.train(obs, states, rewards, masks, actions, values, update, evaluated_return)
+        print("#: {}".format(update))
+        episode_complete = runner.run(goal_obs=goal_obses_for_behavior, random_mask=random_actions_per_env)
+
+        if model.num_goals_in_buffer() >= num_goals_per_update:
+            goal_obses_for_update = model.sample_goals_for_update(num_goals_per_update)
+            obses, actions, rewards, next_obses, terminal_masks, goal_obses_for_update = model.replay_buffer.sample(batch_size=batch_size, goal_obses=goal_obses_for_update)  # complete this function call
+            q_value_loss = model.train_controller(obses, next_obses, goal_obses_for_update, rewards, actions, terminal_masks, update, evaluated_return)
+
+        if update % target_update_freq == 0:
+            model.synchronize_target_net()
+
         nseconds = time.time() - tstart
         fps = int((update * nbatch) / nseconds)
 
+        for env_idx in range(nenvs):
+            time_steps_per_env[env_idx] += 1
+            if episode_complete[env_idx] or time_steps_per_env[env_idx] >= timesteps_per_episode:
+                time_steps_per_env[env_idx] = 0
+                if np.random.rand() < EPSILON or model.num_goals_in_buffer() < num_goals_per_update:
+                    random_actions_per_env[env_idx] = True
+                else:
+                    random_actions_per_env[env_idx] = False
+                    goal_obses_for_behavior[env_idx] = model.sample_goals_for_behavior(1)
+
         if update % log_interval == 0 or update == 1:
-            ev = explained_variance(values, rewards)
+            # ev = explained_variance(values, rewards)
             logger.record_tabular("nupdates", update)
             logger.record_tabular("total_timesteps", update*nbatch)
             logger.record_tabular("fps", fps)
-            logger.record_tabular("policy_entropy", float(policy_entropy))
-            logger.record_tabular("value_loss", float(value_loss))
-            logger.record_tabular("explained_variance", float(ev))
+            logger.record_tabular("q_value_loss", q_value_loss)
+            # logger.record_tabular("policy_entropy", float(policy_entropy))
+            # logger.record_tabular("value_loss", float(value_loss))
+            # logger.record_tabular("explained_variance", float(ev))
             logger.record_tabular("eval_return", float(evaluated_return))
             logger.dump_tabular()
 
+        # TODO: fix evaluation
         if update % eval_interval == 0:
             evaluated_return = runner.eval(eval_steps)
 

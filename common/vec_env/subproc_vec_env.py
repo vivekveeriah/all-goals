@@ -2,10 +2,13 @@ import numpy as np
 from multiprocessing import Process, Pipe
 from . import VecEnv
 
-
 def worker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
+    # env = env_fn_wrapper
+    # print('++++++ before env initialized')
+    # print('env_fn_wrapper: {}'.format(env_fn_wrapper.x))
     env = env_fn_wrapper.x()
+    # print('++++++ env initialized')
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
@@ -15,6 +18,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
             remote.send((ob, reward, done, info))
         elif cmd == 'reset':
             ob = env.reset()
+            # print('---recvd ob from env')
             remote.send(ob)
         elif cmd == 'reset_task':
             ob = env.reset_task()
@@ -50,17 +54,20 @@ class SubprocVecEnv(VecEnv):
         self.closed = False
         nenvs = len(env_fns)
         self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
+        # print('initialized pipes')
         self.ps = [Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
+        # self.ps = [Process(target=worker, args=(work_remote, remote, env_fn))
+        #            for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
         for p in self.ps:
             p.daemon = True # if the main process crashes, we should not cause things to hang
             p.start()
+            # print('initialized workers')
         for remote in self.work_remotes:
             remote.close()
 
         self.remotes[0].send(('get_spaces', None))
         self.action_space, self.observation_space = self.remotes[0].recv()
-
 
     def step(self, actions):
         for remote, action in zip(self.remotes, actions):
@@ -72,6 +79,8 @@ class SubprocVecEnv(VecEnv):
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
+            # print('+++ successfully sent')
+        # print([remote.recv() for remote in self.remotes])
         return np.stack([remote.recv() for remote in self.remotes])
 
     def reset_task(self):

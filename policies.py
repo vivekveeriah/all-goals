@@ -119,13 +119,13 @@ class CnnPolicy(object):
         self.value = value
 
 class MasteryPolicy(object):
-    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, scope_name="model", reuse=False):
+    def __init__(self, sess, obs_space, ac_space, nenv, nsteps, nstack=1, name_scope="model", reuse=False):
         nbatch = nenv * nsteps
-        nh, nw, nc = obs_space.space
+        nh, nw, nc = obs_space.shape
         nact = ac_space.n
         X = tf.placeholder(tf.uint8, shape=(None, nh, nw, nc * nstack))
         GX = tf.placeholder(tf.uint8, shape=(None, nh, nw, nc * nstack))
-        with tf.variable_scope(scope_name, reuse=reuse):
+        with tf.variable_scope(name_scope, reuse=reuse):
             # check the filter sizes and strides for conv layers
             h = conv(tf.cast(X, tf.float32) / 255., 'c1', nf=16, rf=2, stride=1, init_scale=np.sqrt(2))
             h1 = conv(h, 'c2', nf=32, rf=2, stride=1, init_scale=np.sqrt(2))
@@ -133,10 +133,10 @@ class MasteryPolicy(object):
             h2 = fc(h1, 'fc1', nh=512, init_scale=np.sqrt(2))
             h3 = fc_embedding(h2, 'x_emb', nh=1024, act=lambda x: x)
 
-            hg = conv(tf.cast(GX, tf.float32) / 255., 'c1', nf=16, rf=2, stride=1, init_scale=np.sqrt(2))
-            hg1 = conv(hg, 'c2', nf=32, rf=2, stride=1, init_scale=np.sqrt(2))
+            hg = conv(tf.cast(GX, tf.float32) / 255., 'c1', nf=16, rf=2, stride=1, init_scale=np.sqrt(2), reuse=True)
+            hg1 = conv(hg, 'c2', nf=32, rf=2, stride=1, init_scale=np.sqrt(2), reuse=True)
             hg1 = conv_to_fc(hg1)
-            gh2 = fc(hg1, 'fc1', nh=512, init_scale=np.sqrt(2))
+            gh2 = fc(hg1, 'fc1', nh=512, init_scale=np.sqrt(2), reuse=True)
             gh3 = fc_embedding(gh2, 'g_emb', nh=1024, act=lambda x: x)
 
             h4 = tf.multiply(h3, gh3)
@@ -145,11 +145,12 @@ class MasteryPolicy(object):
             q = fc(h6, 'q', nact, act=lambda x: x)
 
         q0 = q
+        a0 = sample(q0)
         self.initial_state = []
 
         def step(obs, goal_obs, *_args, **_kwargs):
-            q_value = sess.run([q0], {X: obs, GX: goal_obs})
-            return q_value, []
+            actions = sess.run([a0], {X: obs, GX: goal_obs})
+            return actions, []
 
         def value(obs, goal_obs, *_args, **_kwargs):
             q_value = sess.run([q0], {X: obs, GX: goal_obs})
@@ -158,6 +159,7 @@ class MasteryPolicy(object):
         self.X = X
         self.GX = GX
         self.q = q0
+        self.a = a0
         self.step = step
         self.value = value
 
